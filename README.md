@@ -26,6 +26,7 @@ The program:
 - HTTP request and CONNECT tunnel logging
 - Graceful shutdown on `Ctrl+C`
 - SSH key, SSH agent, or password env auth
+- Easy installation with `go install`
 
 ## Build
 
@@ -33,12 +34,41 @@ The program:
 go build -o sshhttpbridge .
 ```
 
+## Install
+
+Install directly from GitHub with Go:
+
+```bash
+go install github.com/horsley/sshHttpBridge@latest
+```
+
+If your Go bin directory is already in `PATH`, you can then run:
+
+```bash
+sshhttpbridge ubuntu@your.server.ip
+```
+
+This is the recommended installation method for end users because the tool integrates naturally with the local SSH environment, including:
+
+- `~/.ssh` private keys
+- `known_hosts`
+- `SSH_AUTH_SOCK`
+
+Compared with a containerized workflow, `go install` avoids SSH key mounting, agent socket forwarding, and other Docker-specific setup.
+
 ## Usage
 
 ```bash
 ./sshhttpbridge ubuntu@your.server.ip
 ./sshhttpbridge ubuntu@your.server.ip --port 3128
 ./sshhttpbridge ubuntu@your.server.ip --identity ~/.ssh/id_ed25519
+```
+
+Or, if installed with `go install`:
+
+```bash
+sshhttpbridge ubuntu@your.server.ip
+sshhttpbridge ubuntu@your.server.ip --port 3128
 ```
 
 Show help:
@@ -96,46 +126,24 @@ Run them on the remote Ubuntu server, then test:
 curl -I https://example.com
 ```
 
+You can also use package managers and other network clients after exporting the proxy variables, for example:
+
+```bash
+apt update
+git clone https://github.com/golang/go.git
+go env -w GOPROXY=https://proxy.golang.org,direct
+```
+
 When the bridge stops, it prints:
 
 ```bash
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY
 ```
 
-## Docker
-
-Build the image:
-
-```bash
-docker build -t yourdockerhubuser/sshhttpbridge:latest .
-```
-
-Example container run:
-
-```bash
-docker run --rm -it \
-  -v "$HOME/.ssh:/root/.ssh:ro" \
-  -v "$SSH_AUTH_SOCK:/ssh-agent" \
-  -e SSH_AUTH_SOCK=/ssh-agent \
-  yourdockerhubuser/sshhttpbridge:latest \
-  ubuntu@your.server.ip --port 8080
-```
-
-If you use private keys from `/root/.ssh`, the container can authenticate without the local `ssh` binary. If you use SSH agent forwarding, mount the agent socket as shown above.
-
-## Publish To Docker Hub
-
-```bash
-docker login
-docker build -t yourdockerhubuser/sshhttpbridge:latest .
-docker push yourdockerhubuser/sshhttpbridge:latest
-```
-
 ## Suggested Repository Layout
 
 ```text
 sshhttpbridge-app/
-  Dockerfile
   README.md
   go.mod
   go.sum
@@ -151,7 +159,7 @@ sshhttpbridge-app/
 
 ## Repository
 
-Planned repository path:
+Repository path:
 
 ```text
 github.com/horsley/sshHttpBridge
