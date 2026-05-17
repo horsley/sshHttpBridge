@@ -73,18 +73,86 @@ func TestProxyHints(t *testing.T) {
 
 	got := proxyExportBlock("127.0.0.1", 8080)
 	want := "" +
-		"export http_proxy=http://127.0.0.1:8080\n" +
-		"export https_proxy=http://127.0.0.1:8080\n" +
-		"export HTTP_PROXY=http://127.0.0.1:8080\n" +
-		"export HTTPS_PROXY=http://127.0.0.1:8080\n" +
-		"export no_proxy=localhost,127.0.0.1,::1\n" +
-		"export NO_PROXY=localhost,127.0.0.1,::1"
+		"export http_proxy=http://127.0.0.1:8080 " +
+		"https_proxy=http://127.0.0.1:8080 " +
+		"HTTP_PROXY=http://127.0.0.1:8080 " +
+		"HTTPS_PROXY=http://127.0.0.1:8080 " +
+		"no_proxy=localhost,127.0.0.1,::1 " +
+		"NO_PROXY=localhost,127.0.0.1,::1"
 	if got != want {
 		t.Fatalf("proxyExportBlock mismatch:\n%s", got)
 	}
 
 	if proxyUnsetLine() != "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY" {
 		t.Fatalf("unexpected unset line: %s", proxyUnsetLine())
+	}
+}
+
+func TestRemoteDialRules(t *testing.T) {
+	t.Parallel()
+
+	rules, err := parseRemoteDialRules(".corp.local,registry.internal,10.0.0.0/8,2001:db8::/32")
+	if err != nil {
+		t.Fatalf("parseRemoteDialRules: %v", err)
+	}
+
+	tests := []struct {
+		host string
+		want bool
+	}{
+		{host: "api.corp.local:443", want: true},
+		{host: "corp.local:443", want: true},
+		{host: "REGISTRY.INTERNAL:443", want: true},
+		{host: "10.12.0.8:443", want: true},
+		{host: "[2001:db8::1]:443", want: true},
+		{host: "example.com:443", want: false},
+		{host: "172.16.0.1:443", want: false},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.host, func(t *testing.T) {
+			t.Parallel()
+
+			if got := rules.Match(tc.host); got != tc.want {
+				t.Fatalf("Match(%q) = %v, want %v", tc.host, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRemoteDialRulesRejectInvalidCIDR(t *testing.T) {
+	t.Parallel()
+
+	if _, err := parseRemoteDialRules("10.0.0.0/99"); err == nil {
+		t.Fatal("expected invalid CIDR error")
+	}
+}
+
+func TestRoutingDialerRouteForAddress(t *testing.T) {
+	t.Parallel()
+
+	rules, err := parseRemoteDialRules("*.example.com")
+	if err != nil {
+		t.Fatalf("parseRemoteDialRules: %v", err)
+	}
+	if got := rules.Match("api.example.com:443"); !got {
+		t.Fatalf("wildcard-style host should match subdomain, got %v", got)
+	}
+	if got := rules.Match("example.com:443"); got {
+		t.Fatalf("wildcard-style host should not match apex domain, got %v", got)
+	}
+
+	rules, err = parseRemoteDialRules(".example.com")
+	if err != nil {
+		t.Fatalf("parseRemoteDialRules: %v", err)
+	}
+	dialer := routingDialer{rules: rules}
+	if got := dialer.RouteForAddress("api.example.com:443"); got != dialRouteRemote {
+		t.Fatalf("RouteForAddress() = %s, want %s", got, dialRouteRemote)
+	}
+	if got := dialer.RouteForAddress("api.other:443"); got != dialRouteLocal {
+		t.Fatalf("RouteForAddress() = %s, want %s", got, dialRouteLocal)
 	}
 }
 

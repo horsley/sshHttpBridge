@@ -84,6 +84,8 @@ Show help:
   Remote HTTP proxy port. Default: `8080`
 - `--bind`
   Remote bind address on the SSH server. Default: `127.0.0.1`
+- `--remote-dial`
+  Comma-separated hosts, domain suffixes, wildcards, or CIDRs that should be connected from the SSH server instead of locally. Examples: `.corp.local,*.svc.cluster.local,registry.internal,10.0.0.0/8`
 - `--identity`
   SSH private key path
 - `--identity-passphrase-env`
@@ -109,15 +111,16 @@ Start the bridge on your local machine:
 ./sshhttpbridge ubuntu@your.server.ip --port 8080
 ```
 
+If some targets only resolve or route from the remote server, keep public traffic going through your local machine and route those internal targets back through SSH remote dial:
+
+```bash
+./sshhttpbridge ubuntu@your.server.ip --port 8080 --remote-dial ".corp.local,*.svc.cluster.local,10.0.0.0/8"
+```
+
 The program prints commands like:
 
 ```bash
-export http_proxy=http://127.0.0.1:8080
-export https_proxy=http://127.0.0.1:8080
-export HTTP_PROXY=http://127.0.0.1:8080
-export HTTPS_PROXY=http://127.0.0.1:8080
-export no_proxy=localhost,127.0.0.1,::1
-export NO_PROXY=localhost,127.0.0.1,::1
+export http_proxy=http://127.0.0.1:8080 https_proxy=http://127.0.0.1:8080 HTTP_PROXY=http://127.0.0.1:8080 HTTPS_PROXY=http://127.0.0.1:8080 no_proxy=localhost,127.0.0.1,::1 NO_PROXY=localhost,127.0.0.1,::1
 ```
 
 Run them on the remote Ubuntu server, then test:

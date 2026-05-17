@@ -50,6 +50,7 @@ type options struct {
 	insecureHostKey       bool
 	remoteBind            string
 	remotePort            int
+	remoteDialRules       string
 	connectTimeout        time.Duration
 	reconnectDelay        time.Duration
 	keepAliveInterval     time.Duration
@@ -63,8 +64,39 @@ type sshTarget struct {
 }
 
 type proxyServer struct {
-	logger    *log.Logger
-	transport *http.Transport
+	logger         *log.Logger
+	outboundDialer *routingDialer
+	transport      *http.Transport
+}
+
+type sshDialer interface {
+	Dial(network, addr string) (net.Conn, error)
+}
+
+type currentSSHDialer struct {
+	mu     sync.RWMutex
+	client sshDialer
+}
+
+type dialRoute string
+
+const (
+	dialRouteLocal  dialRoute = "local"
+	dialRouteRemote dialRoute = "remote"
+)
+
+type routingDialer struct {
+	local   *net.Dialer
+	remote  *currentSSHDialer
+	rules   remoteDialRules
+	timeout time.Duration
+}
+
+type remoteDialRules struct {
+	all      bool
+	exacts   map[string]struct{}
+	suffixes []string
+	cidrs    []*net.IPNet
 }
 
 func main() {
@@ -106,6 +138,7 @@ func newRootCmd(logger *log.Logger) *cobra.Command {
 	flags.BoolVar(&opts.insecureHostKey, "insecure-host-key", false, "skip SSH host key verification")
 	flags.StringVar(&opts.remoteBind, "bind", defaultRemoteBind, "remote bind address on the SSH server")
 	flags.IntVar(&opts.remotePort, "port", defaultRemotePort, "remote HTTP proxy port on the SSH server")
+	flags.StringVar(&opts.remoteDialRules, "remote-dial", "", "comma-separated hosts, domain suffixes, or CIDRs to connect from the SSH server instead of locally")
 	flags.DurationVar(&opts.connectTimeout, "connect-timeout", 10*time.Second, "SSH dial timeout")
 	flags.DurationVar(&opts.reconnectDelay, "reconnect-delay", 5*time.Second, "delay before reconnect attempts")
 	flags.DurationVar(&opts.keepAliveInterval, "keepalive", 30*time.Second, "SSH keepalive interval")
@@ -125,6 +158,10 @@ func defaultOptions() options {
 func run(parent context.Context, logger *log.Logger, opts options) error {
 	if opts.remotePort < 1 || opts.remotePort > 65535 {
 		return fmt.Errorf("invalid --port %d", opts.remotePort)
+	}
+	remoteDialRules, err := parseRemoteDialRules(opts.remoteDialRules)
+	if err != nil {
+		return err
 	}
 	opts.identity = expandPath(opts.identity)
 	opts.knownHosts = expandPath(opts.knownHosts)
@@ -157,7 +194,8 @@ func run(parent context.Context, logger *log.Logger, opts options) error {
 		Timeout:         opts.connectTimeout,
 	}
 
-	proxy := newProxyServer(logger)
+	sshDialerRef := &currentSSHDialer{}
+	proxy := newProxyServer(logger, sshDialerRef, remoteDialRules)
 	remoteAddr := net.JoinHostPort(opts.remoteBind, fmt.Sprintf("%d", opts.remotePort))
 	logger.Printf("starting bridge to %s via SSH target %s", remoteAddr, target.address)
 
@@ -176,9 +214,11 @@ func run(parent context.Context, logger *log.Logger, opts options) error {
 			waitForReconnect(ctx, opts.reconnectDelay)
 			continue
 		}
+		sshDialerRef.Set(client)
 
 		listener, err := client.Listen("tcp", remoteAddr)
 		if err != nil {
+			sshDialerRef.Clear(client)
 			_ = client.Close()
 			logger.Printf("remote listen failed on %s: %v", remoteAddr, err)
 			waitForReconnect(ctx, opts.reconnectDelay)
@@ -203,6 +243,7 @@ func run(parent context.Context, logger *log.Logger, opts options) error {
 		err = acceptLoop(bridgeCtx, listener, proxy, logger)
 		bridgeCancel()
 		keepAliveCancel()
+		sshDialerRef.Clear(client)
 		_ = listener.Close()
 		_ = client.Close()
 
@@ -239,15 +280,88 @@ func acceptLoop(ctx context.Context, listener net.Listener, proxy *proxyServer, 
 	}
 }
 
-func newProxyServer(logger *log.Logger) *proxyServer {
+func (d *currentSSHDialer) Set(client sshDialer) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.client = client
+}
+
+func (d *currentSSHDialer) Clear(client sshDialer) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.client == client {
+		d.client = nil
+	}
+}
+
+func (d *currentSSHDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	d.mu.RLock()
+	client := d.client
+	d.mu.RUnlock()
+	if client == nil {
+		return nil, errors.New("no active SSH client for remote dial")
+	}
+
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	resultCh := make(chan dialResult, 1)
+	go func() {
+		conn, err := client.Dial(network, addr)
+		resultCh <- dialResult{conn: conn, err: err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		go func() {
+			result := <-resultCh
+			if result.conn != nil {
+				_ = result.conn.Close()
+			}
+		}()
+		return nil, ctx.Err()
+	case result := <-resultCh:
+		return result.conn, result.err
+	}
+}
+
+func (d *routingDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	if _, ok := ctx.Deadline(); !ok && d.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, d.timeout)
+		defer cancel()
+	}
+	if d.RouteForAddress(address) == dialRouteRemote {
+		return d.remote.DialContext(ctx, network, address)
+	}
+	return d.local.DialContext(ctx, network, address)
+}
+
+func (d *routingDialer) RouteForAddress(address string) dialRoute {
+	host := hostFromAddress(address)
+	if d.rules.Match(host) {
+		return dialRouteRemote
+	}
+	return dialRouteLocal
+}
+
+func newProxyServer(logger *log.Logger, remote *currentSSHDialer, rules remoteDialRules) *proxyServer {
+	outboundDialer := &routingDialer{
+		local: &net.Dialer{
+			Timeout:   15 * time.Second,
+			KeepAlive: 30 * time.Second,
+		},
+		remote:  remote,
+		rules:   rules,
+		timeout: 15 * time.Second,
+	}
 	return &proxyServer{
-		logger: logger,
+		logger:         logger,
+		outboundDialer: outboundDialer,
 		transport: &http.Transport{
-			Proxy: nil,
-			DialContext: (&net.Dialer{
-				Timeout:   15 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
+			Proxy:                 nil,
+			DialContext:           outboundDialer.DialContext,
 			ForceAttemptHTTP2:     true,
 			MaxIdleConns:          100,
 			IdleConnTimeout:       90 * time.Second,
@@ -294,14 +408,15 @@ func (p *proxyServer) handleHTTP(conn net.Conn, req *http.Request) error {
 
 	start := time.Now()
 	target := outReq.URL.String()
-	p.logger.Printf("proxy http from=%s method=%s url=%s", conn.RemoteAddr(), outReq.Method, target)
+	route := p.outboundDialer.RouteForAddress(outReq.URL.Host)
+	p.logger.Printf("proxy http from=%s method=%s url=%s route=%s", conn.RemoteAddr(), outReq.Method, target, route)
 
 	removeHopHeaders(outReq.Header)
 	outReq.Header.Del("Proxy-Connection")
 
 	resp, err := p.transport.RoundTrip(outReq)
 	if err != nil {
-		p.logger.Printf("proxy http failed from=%s method=%s url=%s err=%v", conn.RemoteAddr(), outReq.Method, target, err)
+		p.logger.Printf("proxy http failed from=%s method=%s url=%s route=%s err=%v", conn.RemoteAddr(), outReq.Method, target, route, err)
 		return writeProxyError(conn, http.StatusBadGateway, fmt.Sprintf("upstream request failed: %v", err))
 	}
 	defer resp.Body.Close()
@@ -310,7 +425,7 @@ func (p *proxyServer) handleHTTP(conn net.Conn, req *http.Request) error {
 	resp.Close = true
 	resp.Header.Set("Connection", "close")
 
-	p.logger.Printf("proxy http done from=%s method=%s url=%s status=%d duration=%s", conn.RemoteAddr(), outReq.Method, target, resp.StatusCode, time.Since(start).Round(time.Millisecond))
+	p.logger.Printf("proxy http done from=%s method=%s url=%s route=%s status=%d duration=%s", conn.RemoteAddr(), outReq.Method, target, route, resp.StatusCode, time.Since(start).Round(time.Millisecond))
 	return resp.Write(conn)
 }
 
@@ -318,11 +433,14 @@ func (p *proxyServer) handleConnect(clientConn net.Conn, reader *bufio.Reader, r
 	defer req.Body.Close()
 
 	start := time.Now()
-	p.logger.Printf("proxy connect from=%s target=%s", clientConn.RemoteAddr(), req.Host)
+	route := p.outboundDialer.RouteForAddress(req.Host)
+	p.logger.Printf("proxy connect from=%s target=%s route=%s", clientConn.RemoteAddr(), req.Host, route)
 
-	targetConn, err := net.DialTimeout("tcp", req.Host, 15*time.Second)
+	dialCtx, cancel := context.WithTimeout(req.Context(), 15*time.Second)
+	defer cancel()
+	targetConn, err := p.outboundDialer.DialContext(dialCtx, "tcp", req.Host)
 	if err != nil {
-		p.logger.Printf("proxy connect failed from=%s target=%s err=%v", clientConn.RemoteAddr(), req.Host, err)
+		p.logger.Printf("proxy connect failed from=%s target=%s route=%s err=%v", clientConn.RemoteAddr(), req.Host, route, err)
 		return writeProxyError(clientConn, http.StatusBadGateway, fmt.Sprintf("connect target failed: %v", err))
 	}
 	defer targetConn.Close()
@@ -362,11 +480,11 @@ func (p *proxyServer) handleConnect(clientConn net.Conn, reader *bufio.Reader, r
 	}
 
 	if firstErr != nil {
-		p.logger.Printf("proxy connect closed from=%s target=%s duration=%s err=%v", clientConn.RemoteAddr(), req.Host, time.Since(start).Round(time.Millisecond), firstErr)
+		p.logger.Printf("proxy connect closed from=%s target=%s route=%s duration=%s err=%v", clientConn.RemoteAddr(), req.Host, route, time.Since(start).Round(time.Millisecond), firstErr)
 		return firstErr
 	}
 
-	p.logger.Printf("proxy connect closed from=%s target=%s duration=%s", clientConn.RemoteAddr(), req.Host, time.Since(start).Round(time.Millisecond))
+	p.logger.Printf("proxy connect closed from=%s target=%s route=%s duration=%s", clientConn.RemoteAddr(), req.Host, route, time.Since(start).Round(time.Millisecond))
 	return nil
 }
 
@@ -382,6 +500,82 @@ func removeHopHeaders(header http.Header) {
 			}
 		}
 	}
+}
+
+func parseRemoteDialRules(raw string) (remoteDialRules, error) {
+	rules := remoteDialRules{
+		exacts: make(map[string]struct{}),
+	}
+	for _, part := range strings.Split(raw, ",") {
+		token := normalizeHost(part)
+		if token == "" {
+			continue
+		}
+		if token == "*" {
+			rules.all = true
+			continue
+		}
+		if strings.Contains(token, "/") {
+			_, ipNet, err := net.ParseCIDR(token)
+			if err != nil {
+				return remoteDialRules{}, fmt.Errorf("invalid --remote-dial CIDR %q: %w", token, err)
+			}
+			rules.cidrs = append(rules.cidrs, ipNet)
+			continue
+		}
+		if strings.HasPrefix(token, "*.") {
+			rules.suffixes = append(rules.suffixes, strings.TrimPrefix(token, "*"))
+			continue
+		}
+		if strings.HasPrefix(token, ".") {
+			rules.suffixes = append(rules.suffixes, token)
+			rules.exacts[strings.TrimPrefix(token, ".")] = struct{}{}
+			continue
+		}
+		rules.exacts[token] = struct{}{}
+	}
+	return rules, nil
+}
+
+func (r remoteDialRules) Match(host string) bool {
+	host = normalizeHost(hostFromAddress(host))
+	if host == "" {
+		return false
+	}
+	if r.all {
+		return true
+	}
+	if _, ok := r.exacts[host]; ok {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		for _, cidr := range r.cidrs {
+			if cidr.Contains(ip) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, suffix := range r.suffixes {
+		if strings.HasSuffix(host, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func hostFromAddress(address string) string {
+	if host, _, err := net.SplitHostPort(address); err == nil {
+		return host
+	}
+	return address
+}
+
+func normalizeHost(host string) string {
+	host = strings.TrimSpace(host)
+	host = strings.Trim(host, "[]")
+	host = strings.TrimSuffix(host, ".")
+	return strings.ToLower(host)
 }
 
 func writeProxyError(conn net.Conn, status int, msg string) error {
@@ -549,14 +743,14 @@ func printShutdownHints(w io.Writer) {
 
 func proxyExportBlock(host string, port int) string {
 	proxyURL := fmt.Sprintf("http://%s", net.JoinHostPort(host, fmt.Sprintf("%d", port)))
-	return strings.Join([]string{
-		fmt.Sprintf("export http_proxy=%s", proxyURL),
-		fmt.Sprintf("export https_proxy=%s", proxyURL),
-		fmt.Sprintf("export HTTP_PROXY=%s", proxyURL),
-		fmt.Sprintf("export HTTPS_PROXY=%s", proxyURL),
-		"export no_proxy=localhost,127.0.0.1,::1",
-		"export NO_PROXY=localhost,127.0.0.1,::1",
-	}, "\n")
+	return "export " + strings.Join([]string{
+		fmt.Sprintf("http_proxy=%s", proxyURL),
+		fmt.Sprintf("https_proxy=%s", proxyURL),
+		fmt.Sprintf("HTTP_PROXY=%s", proxyURL),
+		fmt.Sprintf("HTTPS_PROXY=%s", proxyURL),
+		"no_proxy=localhost,127.0.0.1,::1",
+		"NO_PROXY=localhost,127.0.0.1,::1",
+	}, " ")
 }
 
 func proxyUnsetLine() string {
